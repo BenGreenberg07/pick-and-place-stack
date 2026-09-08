@@ -10,7 +10,10 @@ from pathlib import Path
 import numpy as np
 
 from ..frames import Point2D, RigidTransform2D
-from .homography import apply_homography, fit_homography, reprojection_error
+from .distortion import RadialDistortion, estimate_k1
+from .homography import (
+    apply_homography, fit_homography, fit_homography_ransac, reprojection_error,
+)
 
 
 class CalibrationError(RuntimeError):
@@ -58,6 +61,12 @@ class CameraCalibration:
     bounds: WorkspaceBounds
     fit_residuals_mm: np.ndarray
     max_residual_mm: float = 3.0
+    # Optional lens model. When present every pixel is undistorted before the
+    # homography sees it, because a homography is only exact for a pinhole.
+    distortion: RadialDistortion | None = None
+    # Which fiducials RANSAC kept, when it was used. A False here is a
+    # correspondence that was actively excluded rather than merely noisy.
+    inliers: np.ndarray | None = None
 
     @property
     def rms_residual_mm(self) -> float:
@@ -73,8 +82,12 @@ class CameraCalibration:
 
     # ----------------------------------------------------------- transforms
 
+    def _undistort(self, uv: np.ndarray) -> np.ndarray:
+        return self.distortion.undistort(uv) if self.distortion else np.atleast_2d(uv)
+
     def pixel_to_table(self, u: float, v: float) -> Point2D:
-        xy = apply_homography(self.H_pixel_to_table, np.array([[u, v]]))[0]
+        uv = self._undistort(np.array([[float(u), float(v)]]))
+        xy = apply_homography(self.H_pixel_to_table, uv)[0]
         return Point2D(float(xy[0]), float(xy[1]), "table")
 
     def pixels_to_table(self, uv: np.ndarray) -> np.ndarray:
@@ -82,13 +95,15 @@ class CameraCalibration:
         uv = np.atleast_2d(np.asarray(uv, dtype=float))
         if len(uv) == 0:
             return np.empty((0, 2))
-        return apply_homography(self.H_pixel_to_table, uv)
+        return apply_homography(self.H_pixel_to_table, self._undistort(uv))
 
     def table_to_pixel(self, p: Point2D) -> tuple[float, float]:
         p.require("table")
         H_inv = np.linalg.inv(self.H_pixel_to_table)
-        uv = apply_homography(H_inv, np.array([[p.x, p.y]]))[0]
-        return float(uv[0]), float(uv[1])
+        uv = apply_homography(H_inv, np.array([[p.x, p.y]]))
+        if self.distortion:
+            uv = self.distortion.distort(uv)
+        return float(uv[0, 0]), float(uv[0, 1])
 
     def pixel_to_base(self, u: float, v: float) -> Point2D:
         """The whole chain, which is the one call the pipeline actually makes."""
@@ -123,7 +138,19 @@ class CameraCalibration:
         table_to_base: RigidTransform2D,
         bounds: WorkspaceBounds,
         max_residual_mm: float = 3.0,
+        robust: bool = False,
+        ransac_threshold_mm: float = 2.0,
+        estimate_distortion: bool = False,
+        image_size: tuple[int, int] | None = None,
     ) -> "CameraCalibration":
+        """Fit the pixel-to-table map.
+
+        `robust` swaps least squares for RANSAC, which excludes a mis-clicked
+        fiducial instead of smearing its error across every other one.
+        `estimate_distortion` additionally recovers a one-parameter radial lens
+        model from the same points, which needs `image_size` and more than four
+        fiducials.
+        """
         pixel_pts = np.asarray(pixel_pts, float)
         table_pts = np.asarray(table_pts, float)
         if len(pixel_pts) == 4:
@@ -133,9 +160,27 @@ class CameraCalibration:
                 "bad calibration. Use 6 or more fiducials.",
                 stacklevel=2,
             )
-        H = fit_homography(pixel_pts, table_pts)
-        res = reprojection_error(H, pixel_pts, table_pts)
-        return cls(H, table_to_base, bounds, res, max_residual_mm)
+        lens = None
+        if estimate_distortion:
+            if image_size is None:
+                raise ValueError("estimate_distortion needs image_size")
+            lens, _ = estimate_k1(pixel_pts, table_pts, image_size)
+        fit_pts = lens.undistort(pixel_pts) if lens else pixel_pts
+
+        inliers = None
+        if robust:
+            H, inliers = fit_homography_ransac(
+                fit_pts, table_pts, threshold=ransac_threshold_mm
+            )
+        else:
+            H = fit_homography(fit_pts, table_pts)
+        res = reprojection_error(H, fit_pts, table_pts)
+        if inliers is not None:
+            # Judge the calibration on the points it actually used. Including
+            # a rejected outlier's residual would make every robust fit look
+            # like a failure and trip the acceptance guard.
+            res = res[inliers]
+        return cls(H, table_to_base, bounds, res, max_residual_mm, lens, inliers)
 
     # ------------------------------------------------------------------ i/o
 
@@ -148,6 +193,11 @@ class CameraCalibration:
                     "bounds": asdict(self.bounds),
                     "fit_residuals_mm": self.fit_residuals_mm.tolist(),
                     "max_residual_mm": self.max_residual_mm,
+                    "distortion": (
+                        {"k1": self.distortion.k1, "center": list(self.distortion.center),
+                         "norm": self.distortion.norm}
+                        if self.distortion else None
+                    ),
                 },
                 indent=2,
             )
@@ -162,4 +212,13 @@ class CameraCalibration:
             bounds=WorkspaceBounds(**d["bounds"]),
             fit_residuals_mm=np.asarray(d["fit_residuals_mm"], float),
             max_residual_mm=float(d["max_residual_mm"]),
+            distortion=(
+                RadialDistortion(
+                    float(d["distortion"]["k1"]),
+                    tuple(d["distortion"]["center"]),
+                    float(d["distortion"]["norm"]),
+                )
+                if d.get("distortion")
+                else None
+            ),
         )

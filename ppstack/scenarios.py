@@ -44,6 +44,23 @@ def home_configuration(arm: PlanarArm) -> np.ndarray:
     return solve(arm, Point2D(*HOME_BASE_XY, "base")).q
 
 
+# One bin per colour along the near edge. Sorting into per-colour bins is what
+# makes the pick order matter: two blocks of the same colour on opposite sides
+# of the table both have to end up in the same place, so the order the detector
+# happens to list them in sends the arm back and forth.
+DEFAULT_BINS = (
+    ("red", 60.0, 35.0),
+    ("blue", 200.0, 35.0),
+    ("green", 340.0, 35.0),
+)
+
+
+def default_bins():
+    from .task import Bin
+
+    return [Bin(f"{c}-bin", x, y, (c,)) for c, x, y in DEFAULT_BINS]
+
+
 SCENARIOS: dict[str, list[Block]] = {
     # A clear shot: nothing between the arm and the block.
     "clear": [
@@ -75,6 +92,18 @@ SCENARIOS: dict[str, list[Block]] = {
         Block(70.0, 220.0, 0.15, 44.0, "blue"),
         Block(340.0, 90.0, -0.6, 40.0, "green"),
         Block(200.0, 250.0, 0.3, 38.0, "yellow"),
+    ],
+    # Eight blocks, four colour bins, one wall. Built for the task layer: the
+    # order the detector happens to report the blocks in sends the arm back and
+    # forth across the table, so the sequencing has something real to fix.
+    "sorting": [
+        Block(80.0, 120.0, 0.30, 38.0, "red"),
+        Block(320.0, 230.0, -0.20, 38.0, "red"),
+        Block(200.0, 120.0, 0.45, 38.0, "blue"),
+        Block(80.0, 230.0, -0.35, 38.0, "blue"),
+        Block(320.0, 120.0, 0.15, 38.0, "green"),
+        Block(200.0, 230.0, -0.50, 38.0, "green"),
+        Block(260.0, 175.0, 0.0, 44.0, "obstacle"),
     ],
     # The block is out past the arm's reach: the pipeline should say so, in the
     # transform stage, rather than handing the IK an impossible target.

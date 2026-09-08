@@ -79,6 +79,38 @@ def _nearest_truth(sc, target):
     return min(same, key=lambda b: (b.x - target.position.x) ** 2 + (b.y - target.position.y) ** 2)
 
 
+def cmd_task(args: argparse.Namespace) -> int:
+    """Run a whole multi-object pick-and-place cycle."""
+    from .scenarios import default_bins
+    from .task import TaskExecutor
+
+    sc, cal, arm, pipe = _build(args.scenario, args.backend, args.seed, args.calib_noise)
+    frame = sc.render()
+    q_home = home_configuration(arm)
+    result = pipe.run(frame, target_color=args.target, q_start=q_home)
+    if not result.objects:
+        print("perception found nothing", file=sys.stderr)
+        return 1
+
+    bins = default_bins()
+    executor = TaskExecutor(arm, cal, collision_aware=not args.no_collision_check)
+    execution = executor.run(result.objects, bins, q_start=q_home)
+    print(f"scenario: {args.scenario}   calibration RMS: {cal.rms_residual_mm:.2f} mm")
+    print(execution.summary())
+    if not execution.ok:
+        return 1
+
+    if args.gif or args.save:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from .viz.task_render import save_task_gif
+
+        if args.gif:
+            print("wrote", save_task_gif(args.gif, frame, result, execution, arm, cal, bins, sc))
+    return 0
+
+
 def cmd_webcam(args: argparse.Namespace) -> int:
     """Run the perception stage on a live camera.
 
@@ -127,7 +159,7 @@ def cmd_webcam(args: argparse.Namespace) -> int:
 def cmd_bench(args: argparse.Namespace) -> int:
     from .benchmark import run_all
 
-    run_all(trials=args.trials)
+    run_all(trials=args.trials, quick=args.quick)
     return 0
 
 
@@ -147,6 +179,18 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--gif", help="write an animated GIF to this path")
     d.set_defaults(func=cmd_demo)
 
+    t = sub.add_parser("task", help="run a full multi-object pick-and-place cycle")
+    t.add_argument("--scenario", default="sorting", choices=sorted(SCENARIOS))
+    t.add_argument("--target", default="red")
+    t.add_argument("--backend", default="auto", choices=["auto", "numpy", "opencv"])
+    t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--calib-noise", type=float, default=0.6)
+    t.add_argument("--no-collision-check", action="store_true",
+                   help="disable whole-arm collision checking (the naive baseline)")
+    t.add_argument("--save", help="write a still figure to this path")
+    t.add_argument("--gif", help="write an animated GIF of the whole cycle")
+    t.set_defaults(func=cmd_task)
+
     w = sub.add_parser("webcam", help="run the detector on a live camera")
     w.add_argument("--device", type=int, default=0)
     w.add_argument("--target", default="red")
@@ -154,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
 
     b = sub.add_parser("bench", help="accuracy and planner benchmarks")
     b.add_argument("--trials", type=int, default=30)
+    b.add_argument("--quick", action="store_true", help="fewer trials, faster")
     b.set_defaults(func=cmd_bench)
 
     args = parser.parse_args(argv)

@@ -1,153 +1,223 @@
 # pick-and-place-stack
 
-A complete 2D robot manipulation stack in Python: a camera looks at a table,
-finds a coloured block among clutter and obstacles, plans a collision-free
-route to it, and solves the joint angles that put the arm's tip on it.
+A complete 2D robot manipulation stack in Python. A camera looks at a table,
+finds coloured blocks among clutter and obstacles, decides what order to move
+them in, plans collision-free routes for the *whole arm*, and solves the joint
+angles to carry each one to its bin.
 
 Camera pixels go in. Joint angles come out. Every stage in between is written
 from the maths up, and the whole chain is scored in millimetres against ground
 truth rather than eyeballed.
 
-![the stack running on the detour scenario](assets/detour.gif)
+![the full pick-and-place cycle](assets/hero.gif)
 
 ```
-python -m ppstack demo --scenario detour
+python -m ppstack task --scenario sorting
 
-perception   ok      31.2 ms  3 objects
-transform    ok       0.1 ms  red at (330, 230) mm
-planning     ok       3.6 ms  62 cells -> 3 corners -> 54 waypoints, 315 mm, 573 expansions
-kinematics   ok       8.1 ms  54 poses, worst tip error 1.10e-05 mm, 0 branch flips
-
-end-to-end target error vs ground truth: 0.22 mm
-arm tip lands at (330.0, 229.8) mm, 0.22 mm from the block centre
+order: blue->blue-bin -> blue->blue-bin -> green->green-bin -> green->green-bin
+       -> red->red-bin -> red->red-bin
+6 block(s) placed in 12 segments, 1987 mm of solved path
+planned tour 1844 mm vs 2360 mm in detection order (22% saved by sequencing)
+365 whole-arm collision checks
 ```
 
-## Why it is one repo and not three
+## Why it is one repo and not five
 
-Detection, path planning and inverse kinematics are each a well-trodden
-exercise. The part that is neither well-trodden nor easy is the seam between
-them: getting a number measured in pixels, on a tilted camera, into the frame
-an arm's joint solver expects, and deciding what the arm should do when
-perception hands it something impossible. That is where this repo spends its
-effort, and it is the part that is missing from the three separate demos.
+Blob detection, path planning and inverse kinematics are each a well-trodden
+exercise. What is neither well-trodden nor easy is the seam between them:
+getting a number measured in pixels, through a tilted and slightly barrelled
+lens, into the frame a joint solver expects; noticing that the solver's answer
+puts the elbow through a wall; and deciding what to do when perception hands
+the planner something impossible. This repo spends its effort on the seams.
+
+Nine things in here are the kind of thing that separates a demo from a system.
+Each one is a measured claim, not an assertion, and each has tests behind it.
+
+| | |
+|---|---|
+| **Square blocks have no principal axis** | The second-moment orientation everyone reaches for is degenerate on a square. Measured on identical data: **22.4° mean error**, versus the 22.5° that uniform noise on a ±45° range would give — it carries no information at all. A ψ₄ order parameter gets **0.20°**. |
+| **Reaching a target ≠ being allowed to** | Up to **82%** of the IK solutions that put the tip exactly on a block drive a link through an obstacle. A tip-only pipeline picks one of them. |
+| **Redundancy is a manifold, not a number** | A 3R arm's solutions form a continuum. Damped least squares finds one point on it; sweeping the end-effector orientation enumerates the whole thing in closed form. |
+| **A 4-point calibration cannot detect its own errors** | It fits its 4 points exactly by construction, so the residual is always zero. Over-determine it, or the guard is theatre. |
+| **One mis-clicked fiducial ruins least squares** | 7.54 mm mean error with 3 bad points; RANSAC gives **0.39 mm** and names which ones were bad. |
+| **A homography assumes a pinhole** | An 0.12 barrel term costs 2.02 mm and hides in the residual. One scalar, searched for, recovers it to ±0.004. |
+| **Greedy data association swaps identities** | **2.2×** the identity switches of optimal assignment under noise. |
+| **Manhattan is inadmissible on an 8-connected grid** | It charges 2 for a √2 step. Measured paths come out up to **3% longer than optimal** while looking fast. |
+| **Pick order is a TSP** | Sorting into per-colour bins, sequencing saves **22%** of travel over detection order. |
 
 ## Measured results
 
-All from `python -m ppstack bench`, on 30 randomly generated scenes with known
-ground-truth block poses.
+Everything below is `python -m ppstack bench`. It is reproducible, seeded, and
+run against synthetic scenes with exactly known ground truth.
 
 ### End-to-end accuracy
 
+30 randomly generated scenes.
+
 | quantity | mean | median | p95 | worst |
 |---|---|---|---|---|
-| block position error | 0.73 mm | 0.75 mm | 0.95 mm | 1.00 mm |
-| grasp angle error | 0.18° | 0.13° | 0.40° | 1.08° |
-| arm tip landing error | 0.73 mm | 0.75 mm | 0.95 mm | 1.00 mm |
-| full pipeline runtime | 43 ms | 42 ms | 51 ms | 55 ms |
+| block position error | 0.72 mm | 0.73 mm | 0.95 mm | 1.00 mm |
+| grasp angle error | 0.17° | 0.11° | 0.40° | 1.08° |
+| arm tip landing error | 0.72 mm | 0.73 mm | 0.95 mm | 1.00 mm |
+| full pipeline runtime | 41 ms | 40 ms | 49 ms | 55 ms |
 
-Sub-millimetre on a 400 x 300 mm table imaged at 640 x 480, which is about
-one pixel. The residual is dominated by the calibration, not by the detector.
+And the orientation estimator, run twice on the same detections:
 
-### How good does the calibration have to be?
+| estimator | mean | median | p95 | worst |
+|---|---|---|---|---|
+| second-moment principal axis | **22.35°** | 23.90° | 41.04° | 43.67° |
+| ψ₄ order parameter | **0.20°** | 0.14° | 0.43° | 1.08° |
 
-Noise is added to the pixel coordinates of the calibration fiducials, which
-simulates clicking them imprecisely.
+Sub-millimetre on a 400 × 300 mm table imaged at 640 × 480, which is about one
+pixel. The residual is dominated by the calibration, not the detector.
 
-| fiducial noise | calibration RMS | mean landing error | outcome |
+### Whole-arm collision: what a tip-only pipeline never looks at
+
+Every solution below puts the end effector *exactly* on the target. The
+question is what the rest of the arm is doing while it does.
+
+| target (table mm) | IK solutions | in collision | fraction |
 |---|---|---|---|
-| 0.0 px | 0.00 mm | 0.82 mm | picked |
-| 0.5 px | 0.37 mm | 0.68 mm | picked |
-| 1.0 px | 0.75 mm | 0.68 mm | picked |
-| 2.0 px | 1.50 mm | 1.11 mm | picked |
-| 3.0 px | 2.25 mm | — | **all runs refused by the residual guard** |
-| 8.0 px | 6.05 mm | — | **all runs refused by the residual guard** |
+| (60, 250) | 40 | 33 | **82%** |
+| (200, 260) | 54 | 22 | 41% |
+| (60, 80) | 96 | 24 | 25% |
+| (340, 250) | 40 | 0 | 0% |
+| (340, 80) | 96 | 2 | 2% |
 
-Two separate things are being shown. Accuracy degrades roughly linearly with
-calibration noise, and past about 2 px the calibration's own residual crosses
-the acceptance threshold and the pipeline stops rather than picking somewhere
-wrong. Failing loudly is the feature.
+And what that means when the whole task runs. "Colliding poses" counts solved
+configurations in which some link is inside an obstacle:
+
+| scenario | collision-aware | tip-only |
+|---|---|---|
+| detour | 0 / 163 | **57 / 163** |
+| gap | 0 / 100 | **40 / 100** |
+| clutter | 0 / 209 | **131 / 209** |
+| sorting | 0 / 303 | **78 / 303** |
+
+Both columns place every block and both look completely fine in the tip's
+trajectory plot. One of them drives the elbow through a wall on 63% of the
+poses in the cluttered scene.
+
+### Task-space A* versus configuration-space RRT*
+
+Two planners for two different problems. A* plans the gripper on a grid, is
+optimal on that grid, and is structurally unable to say anything about the
+elbow. RRT* samples joint vectors and collision-checks the whole linkage.
+
+| planner | raw cost | after shortcutting | nodes | collision checks | seconds |
+|---|---|---|---|---|---|
+| RRT* | 5.34 | 3.86 | 659 | 5910 | 1.19 |
+| RRT | 6.14 | 4.26 | 105 | 1114 | 0.26 |
+
+Cost is joint-space path length in radians. The rewiring earns its keep: 13%
+cheaper raw, 9% cheaper after both are smoothed, for about 5× the work.
 
 ### A* heuristics, checked rather than repeated
 
-40 random obstacle fields, 8-connected grid, tie-breaking disabled so the
-comparison is clean.
+40 random obstacle fields, 8-connected, tie-breaking disabled.
 
 | heuristic | cost / optimal | nodes expanded | time | admissible? |
 |---|---|---|---|---|
 | zero (Dijkstra) | 1.0000 | 2364 | 6.5 ms | yes |
 | euclidean | 1.0000 | 1296 | 4.2 ms | yes |
 | octile | 1.0000 | 985 | 3.3 ms | yes |
-| manhattan | 1.0015 | 424 | 1.5 ms | **no — worst case 1.030x** |
+| manhattan | 1.0015 | 424 | 1.5 ms | **no — worst 1.030×** |
 
-The octile heuristic expands 2.4x fewer nodes than Dijkstra for an identical
-path. Manhattan is faster still and is the trap: on an 8-connected grid it
-charges 2 for a diagonal step that costs √2, so it overestimates, and the
-measured paths come out up to 3% longer than optimal. That is the textbook
-claim, and here it is measured instead of asserted.
+Octile expands 2.4× fewer nodes than Dijkstra for an identical path. Manhattan
+is the trap: fastest, and demonstrably wrong.
 
-## Three things that are genuinely hard
+### Data association: optimal versus greedy
 
-**1. A square has no principal axis.** The standard way to get an object's
-orientation is the eigenvector of its second-moment matrix. For a square that
-matrix is isotropic, the two eigenvalues are equal, and the returned angle is
-pure noise — measured against ground truth it came out at **21.2° mean error on
-a ±45° range**, which is chance. The number always looks plausible, which is
-what makes it dangerous.
+Identity switches over 30 seeded runs of 4 crossing objects.
 
-The fix is to use the symmetry the shape actually has. A square is invariant
-under a quarter turn, so the right estimator is the fourth-order orientational
-order parameter, ψ₄ = Σ wⱼ exp(4iθⱼ), borrowed from condensed-matter physics.
-Every corner term of a real square lands in phase; a round or noisy blob
-cancels. Same data, same pipeline: **0.18° mean error**, and |ψ₄| doubles as a
-confidence score that lets the arm refuse to grasp something that is not a
-block. See [`ppstack/perception/orientation.py`](ppstack/perception/orientation.py).
+| measurement σ | Hungarian | greedy | penalty |
+|---|---|---|---|
+| 2 mm | 0 | 1 | — |
+| 10 mm | 30 | 42 | 1.4× |
+| 25 mm | 69 | 143 | 2.1× |
+| 40 mm | 100 | 206 | 2.1× |
+| 60 mm | 131 | 291 | 2.2× |
 
-**2. Frames, and the fact that nothing checks them for you.** Pixels are y-down,
-table millimetres are y-up, and the arm's base is translated and rotated
-relative to the table. Nothing in Python stops you subtracting a pixel from a
-millimetre. So every position in this codebase carries its frame as a tag, and
-using one in the wrong frame raises `FrameMismatch` rather than producing a
-plausible wrong answer. The grasp angle is measured *after* the footprint is
-mapped into the table frame, because perspective shears a square and an angle
-measured in the image is wrong by a different amount at each corner of the
-table. See [`ppstack/frames.py`](ppstack/frames.py).
+Worth saying plainly: at this detector's real accuracy (0.4 mm) the two agree,
+and the table above is driven by injected noise. That is the honest version.
+The Kalman filter's other job does show up on real output — a track survives a
+3-frame occlusion with **0 identity switches** and 0.41 mm mean error, coasting
+on its motion model while the detector sees nothing at all.
 
-**3. A four-point calibration cannot tell you it is wrong.** A homography needs
-four correspondences and reproduces those four exactly, however badly they were
-measured — its residual is identically zero by construction. It is a perfectly
-convincing calibration that is off by centimetres. The fix is to over-determine
-it: this repo calibrates from a 3x3 fiducial grid so the residual is a real
-diagnostic, and `CameraCalibration.validate()` refuses to run the pipeline when
-it exceeds the threshold. `from_correspondences` warns if you hand it exactly
-four points. See [`ppstack/transforms/calibration.py`](ppstack/transforms/calibration.py).
+### Calibration: sloppy clicks, bad clicks, and a curved lens
+
+Accuracy degrades with fiducial noise, and past about 2 px the calibration's
+own residual crosses the acceptance threshold and the pipeline **refuses to
+run** rather than picking somewhere wrong.
+
+| fiducial noise | calibration RMS | mean landing error | outcome |
+|---|---|---|---|
+| 0.0 px | 0.00 mm | 0.82 mm | picked |
+| 1.0 px | 0.75 mm | 0.68 mm | picked |
+| 2.0 px | 1.50 mm | 1.11 mm | picked |
+| 3.0 px | 2.25 mm | — | **all runs refused by the guard** |
+
+Sloppy clicking is noise. A click on the *wrong corner* is an outlier, and
+least squares has no defence against it — the error gets spread across every
+other point, so nothing looks obviously wrong:
+
+| mis-clicked fiducials | least squares | RANSAC | outliers excluded |
+|---|---|---|---|
+| 0 | 0.41 mm | 0.41 mm | — |
+| 1 | 2.93 mm | **0.40 mm** | 8/8 |
+| 2 | 5.37 mm | **0.40 mm** | 16/16 |
+| 3 | 7.54 mm | **0.39 mm** | 24/24 |
+
+And a homography is only exact for a pinhole. A real lens bows straight lines,
+worst at the frame edges, which is exactly where a table's corners are:
+
+| true k₁ | naive RMS | naive error | aware RMS | aware error | k₁ recovered |
+|---|---|---|---|---|---|
+| +0.00 | 0.34 mm | 0.76 mm | 0.33 mm | 0.71 mm | −0.003 |
+| +0.04 | 0.78 mm | 0.69 mm | 0.34 mm | 0.78 mm | +0.037 |
+| +0.08 | 1.42 mm | 1.33 mm | 0.34 mm | 0.80 mm | +0.076 |
+| +0.12 | 2.02 mm | 2.02 mm | **0.35 mm** | **0.91 mm** | +0.116 |
+
+The distortion parameter needs no extra measurements. For any candidate k₁ you
+can undistort the fiducials, fit a homography and look at the residual; the
+true k₁ is the one that makes the plane-to-plane map actually *be* a
+homography. One scalar, one golden-section search.
 
 ## Architecture
 
 ```
 frame (H, W, 3) uint8
         |
-        |  perception/        HSV threshold with hue wraparound, morphological
-        v                     opening and closing, two-pass union-find connected
-   Detection(u, v, angle,     components, image moments, psi4 orientation
-             area, footprint)
+        |  perception/     HSV threshold with hue wraparound, morphological
+        |                  opening/closing, two-pass union-find components,
+        v                  image moments, psi4 orientation
+   Detection(u, v, angle, area, footprint)
+        |                          \
+        |                           \  tracking/  constant-velocity Kalman +
+        |                            v            Hungarian association -> Track
         |
-        |  transforms/        normalised-DLT homography (pixel -> table mm),
-        v                     rigid transform (table -> arm base), residual guard
-   WorldObject(Point2D in mm, grasp angle, footprint)
+        |  transforms/     radial lens model, normalised-DLT homography
+        v                  (RANSAC optional), rigid transform, residual guard
+   WorldObject(Point2D in mm, grasp angle + confidence, footprint)
         |
-        |  planning/          rasterise real obstacle footprints, inflate by the
-        v                     robot radius into configuration space, A* with
-   [Point2D] path             pluggable heuristic, supercover line-of-sight
-                              shortcutting, even resampling
+        |  task/           per-colour bins, pick sequencing (exact <=6, else
+        v                  nearest-neighbour + 2-opt), world rebuilt per segment
+   [(block, bin)] in order
         |
-        |  kinematics/        closed-form 2-link IK (Law of Cosines, both elbow
-        v                     branches), damped least squares with nullspace
-   JointTrajectory            posture control for the redundant case, quintic
-                              time scaling, seeded solves for continuity
+        |  planning/       obstacle footprints rasterised, C-space inflation,
+        |                  A* on the tip (pluggable heuristic, no corner
+        v                  cutting), OR RRT* on the joints; whole-arm capsule
+        |                  collision checking; line-of-sight shortcutting
+   [Point2D] path  /  [q] configuration path
+        |
+        |  kinematics/     closed-form 2-link IK (both elbow branches),
+        v                  3R self-motion manifold in closed form, damped least
+   JointTrajectory         squares + nullspace, collision-aware branch choice,
+                           quintic time scaling, seeded solves for continuity
 ```
 
-Every stage returns a `StageReport`, and a failure is attributed to the stage
-that caused it:
+Every stage returns a `StageReport`, and failures are attributed to the stage
+that caused them:
 
 ```
 python -m ppstack demo --scenario unreachable
@@ -155,15 +225,28 @@ python -m ppstack demo --scenario unreachable
 perception   ok      25.7 ms  2 objects
 transform    FAIL     0.0 ms  red block is 388 mm from the arm base, outside its
                               reachable annulus [0, 370] mm
-stopped in transform: ...
 ```
 
 An out-of-reach block is a geometry problem, not an IK problem, and the
 pipeline says so before the solver ever sees the target. The failure modes with
-tests behind them are: nothing detected, target colour absent, calibration
-residual too large, target outside the reachable annulus, goal walled off,
-start or goal buried in an obstacle, IK blocked by joint limits, and a
+tests behind them: nothing detected, target colour absent, orientation
+undetermined (ψ₄ too low to be a square), calibration residual too large,
+target outside the reachable annulus, goal walled off, start or goal buried in
+an obstacle, IK blocked by joint limits, **every posture that reaches the target
+in collision**, RRT start or goal in collision, no bin accepting a colour, and a
 trajectory that flips elbow branches mid-path.
+
+## Two collision problems, not one
+
+This distinction is what makes the whole-arm checking usable rather than
+paralysing. The gripper travels in the block plane, so it must avoid every
+block on the table. The links travel *above* that plane, so they pass
+harmlessly over a 20 mm block and only have to avoid things tall enough to
+reach them. The planner builds two grids from the same detections: the tip is
+planned against everything, the arm-body checker sees only tall obstacles.
+
+Conflating them makes a naive implementation declare the entire workspace
+unreachable, which is how this got found.
 
 ## Install and run
 
@@ -174,100 +257,122 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Only numpy is required. matplotlib is needed for the figures, opencv-python
+Only numpy is required. matplotlib and pillow for the figures, opencv-python
 only for the live webcam mode and the alternative detector backend.
 
 ```bash
-python -m ppstack demo --scenario detour --plot   # full stack, three-panel figure
-python -m ppstack demo --scenario gap --gif out.gif
-python -m ppstack bench                           # the tables above
-python -m ppstack webcam                          # detector on a live camera
-pytest -q                                         # 144 tests, ~3 s
+python -m ppstack task --scenario sorting            # full multi-block cycle
+python -m ppstack task --scenario sorting --gif out.gif
+python -m ppstack task --no-collision-check          # the naive baseline
+python -m ppstack demo --scenario detour --plot      # single reach, 3-panel figure
+python -m ppstack bench                              # every table above
+python -m ppstack bench --quick                      # same, fewer trials
+python -m ppstack webcam                             # detector on a live camera
+pytest -q                                            # 225 tests, ~11 s
 ```
 
-Scenarios: `clear`, `detour`, `gap` (a wall with one opening), `clutter`
-(several same-coloured candidates), `unreachable` (expected to fail, in the
+Scenarios: `clear`, `detour`, `gap` (a wall with one opening), `clutter`,
+`sorting` (8 blocks, per-colour bins), `unreachable` (expected to fail, in the
 transform stage).
 
 ## The synthetic camera, and why it is the point
 
 `ppstack/perception/scene.py` renders the table by inverse-mapping every pixel
-into table coordinates through a real perspective homography, then applies a
-lighting gradient, sensor noise and speckle. Because the true block poses are
-known exactly, the whole chain can be **scored in millimetres** rather than
-eyeballed.
+through a real perspective homography and an optional radial lens model, then
+applies a lighting gradient, sensor noise and speckle. Because the true block
+poses are known exactly, the whole chain can be **scored in millimetres**.
 
 That is the difference between a demo and an experiment. A webcam demo can only
-tell you that the box looks like it is on the block; it cannot tell you that
-the pick lands 0.73 mm off, that the error is dominated by the calibration
-rather than the detector, or that switching orientation estimators moved the
-grasp angle from 21.2° to 0.18°. It also means every test runs deterministically
-with no camera attached.
+tell you the box looks like it is on the block. It cannot tell you the pick
+lands 0.73 mm off, that the error is dominated by calibration rather than
+detection, that 82% of the arm postures reaching a given block are in
+collision, or that switching orientation estimators moved the grasp angle from
+22.4° to 0.20°. `scene.sequence()` extends this to motion and occlusion, which
+is what the tracker is scored against.
 
-The live webcam mode exists to show the detector working on real, noisy input.
-It stops after detection, because millimetres require a calibration and a real
-calibration requires clicking real fiducials.
+The live webcam mode runs perception only, and stops there: millimetres require
+a calibration, and a real calibration requires clicking real fiducials.
 
 ## Repository layout
 
 ```
 ppstack/
   frames.py               frame-tagged points and rigid transforms
-  pipeline.py             the stack, wired together, with staged failures
-  benchmark.py            the three experiments above
+  pipeline.py             single-target stack with staged failure attribution
+  task.py                 multi-object cycle, bins, sequencing, world updates
+  benchmark.py            all eight experiments
   scenarios.py            named scenes shared by the demo and the tests
   perception/
-    scene.py              synthetic overhead camera with ground truth
+    scene.py              synthetic camera with ground truth, motion, occlusion
     color.py              RGB->HSV and hue-band thresholding
     morphology.py         erode/dilate/open/close, union-find components, moments
     orientation.py        psi4 orientation for shapes with 4-fold symmetry
-    detector.py           the detector, numpy and OpenCV backends held to parity
+    detector.py           detector, numpy and OpenCV backends held to parity
+    assignment.py         Hungarian algorithm with dual potentials
+    tracking.py           constant-velocity Kalman filters, gating, track lifecycle
   transforms/
-    homography.py         normalised DLT, degeneracy detection
+    homography.py         normalised DLT, degeneracy detection, RANSAC
+    distortion.py         radial lens model, k1 recovered by golden section
     calibration.py        pixel -> table -> base, with the residual guard
   planning/
-    occupancy.py          grids, footprint rasterisation, C-space inflation
+    occupancy.py          grids, footprint rasterisation, re-inflatable C-space
     astar.py              A* with pluggable heuristics, no corner cutting
+    collision.py          whole-arm capsule collision, bisection edge checking
+    rrt.py                RRT* in configuration space, randomised shortcutting
     smoothing.py          supercover line-of-sight, shortcutting, resampling
   kinematics/
     arm.py                FK, analytic Jacobian, limits, manipulability
-    ik.py                 closed-form 2-link, damped least squares + nullspace
+    ik.py                 closed-form 2-link, 3R manifold, DLS, collision-aware
     trajectory.py         quintic time scaling, seeded path following
-  viz/render.py           the three-panel figure and the GIF writer
-tests/                    144 tests
+  viz/                    three-panel figures and the task animation
+tests/                    225 tests
 ```
 
 ## Notes on the implementation
 
-- **Morphology and connected components are written out, not imported.** The
-  numpy implementations are the reference the OpenCV backend is tested against,
-  and they let the whole stack run with numpy alone. A parity test pins the two
-  backends to identical output.
-- **Obstacles are rasterised from their detected footprints**, not from a
-  bounding circle at the centroid. A circle around a wall is simultaneously too
-  wide across it and too short along it.
-- **A* will not cut a diagonal corner** between two blocked cells. A point robot
-  can slip through that slit; a real gripper cannot.
-- **Line of sight uses a supercover line, not Bresenham.** Bresenham picks one
-  cell per column and can hop diagonally between two blocked cells, so a
+- **Morphology, connected components, the Hungarian algorithm and the Kalman
+  filter are written out, not imported.** The numpy implementations are the
+  reference the OpenCV backend is tested against, and they let the whole stack
+  run with numpy alone. A parity test pins the two detector backends to
+  identical output.
+- **Obstacles are rasterised from their detected footprints**, not a bounding
+  circle at the centroid. A circle around a wall is simultaneously too wide
+  across it and too short along it.
+- **The footprint is subsampled on a 2D lattice, not in raster order.** Striding
+  the raster order leaves points far apart along each row and packed down each
+  column, and the grid built from them fills with phantom doorways.
+- **A\* will not cut a diagonal corner** between two blocked cells, and
+  line-of-sight uses a supercover line rather than Bresenham. Bresenham picks
+  one cell per column and can hop diagonally between two blocked cells, so a
   shortcut built on it will declare a route clear that passes through a wall.
+- **RRT\* edges are checked by bisection**, midpoint first. A colliding edge
+  usually fails near its middle, so this finds it in a few checks instead of
+  marching in from one end.
 - **IK solves are seeded from the previous waypoint.** Solved independently,
   adjacent waypoints a millimetre apart can land on different elbow branches and
   the arm snaps through a reconfiguration. Any jump that survives is counted and
   reported rather than silently executed.
-- **The damped least squares solver retries from random seeds** before declaring
-  a target unreachable, because local descent can stall against a joint limit
-  when a solution exists elsewhere in configuration space. 1199/1200 random
-  reachable targets solved on the 3-link arm.
+- **The Kalman update uses the Joseph form**, which stays symmetric and positive
+  definite under round-off where `(I − KH)P` does not. A covariance that drifts
+  out of positive-definiteness breaks the gate, silently.
+- **Association gates on Mahalanobis distance**, so a track that has coasted
+  through three missed frames will accept a detection 40 mm away while a
+  well-observed one will not. A fixed distance threshold cannot express that.
+- **The distortion inverse raises rather than diverging.** Past the fold radius
+  the fixed point does not exist, and the iteration happily returns
+  plausible-looking garbage.
 
 ## Limitations
 
-Planar and kinematic throughout. There is no dynamics, no gripper model, no
-depth, and no closed-loop control: the trajectory is solved, not tracked. The
-occupancy grid is built once per frame rather than incrementally, so moving
-obstacles are handled only by replanning. Obstacle detection keys on darkness,
-which is a stand-in for a real segmentation model. The webcam mode runs
-perception only.
+Planar and kinematic throughout. No dynamics, no gripper model, no depth, and
+no closed-loop control: trajectories are solved, not tracked. Grasping and
+releasing are instantaneous state changes at a waypoint, because there is no z
+axis to descend along. Obstacle detection keys on darkness, standing in for a
+real segmentation model. The occupancy grid is rebuilt between task segments
+rather than incrementally, so moving obstacles are handled only by replanning.
+RRT* is available as a planner and benchmarked against A*, but the task
+executor uses the grid planner with collision-aware IK by default. The webcam
+mode runs perception only.
 
 ## Licence
 

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..transforms.distortion import RadialDistortion
 from ..transforms.homography import apply_homography
 
 # Reference block colours as (R, G, B), 0-255, before lighting is applied.
@@ -63,6 +64,8 @@ class SceneSpec:
     # camera); larger values tilt the camera so the far edge of the table
     # compresses, which is what a real overhead rig actually looks like.
     perspective: float = 0.28
+    # Radial lens distortion. 0 is a pinhole; ~0.1 is a visibly barrelled webcam.
+    distortion_k1: float = 0.0
     lighting_gradient: float = 0.35
     noise_sigma: float = 4.0
     speckle_count: int = 40
@@ -71,6 +74,7 @@ class SceneSpec:
 
     def __post_init__(self) -> None:
         self._H_table_to_pixel = self._build_camera()
+        self._lens = RadialDistortion.for_image(self.image_size, self.distortion_k1)
 
     # ----------------------------------------------------------- the camera
 
@@ -104,12 +108,21 @@ class SceneSpec:
     def H_pixel_to_table(self) -> np.ndarray:
         return np.linalg.inv(self._H_table_to_pixel)
 
+    @property
+    def lens(self) -> RadialDistortion:
+        return self._lens
+
+    def project(self, table_pts: np.ndarray) -> np.ndarray:
+        """Table millimetres to the pixels a real (distorted) camera records."""
+        return self._lens.distort(apply_homography(self._H_table_to_pixel, table_pts))
+
+    def unproject(self, pixel_pts: np.ndarray) -> np.ndarray:
+        """Recorded pixels back to table millimetres, undoing the lens first."""
+        return apply_homography(self.H_pixel_to_table, self._lens.undistort(pixel_pts))
+
     def table_corners_px(self) -> np.ndarray:
         tw, th = self.table_size_mm
-        return apply_homography(
-            self._H_table_to_pixel,
-            np.array([[0, 0], [tw, 0], [tw, th], [0, th]], float),
-        )
+        return self.project(np.array([[0, 0], [tw, 0], [tw, th], [0, th]], float))
 
     def calibration_correspondences(
         self, noise_px: float = 0.0, seed: int = 12, grid: int = 3
@@ -132,7 +145,7 @@ class SceneSpec:
         xs = np.linspace(0.06 * tw, 0.94 * tw, grid)
         ys = np.linspace(0.06 * th, 0.94 * th, grid)
         table_pts = np.array([[x, y] for y in ys for x in xs], dtype=float)
-        pixel_pts = apply_homography(self._H_table_to_pixel, table_pts)
+        pixel_pts = self.project(table_pts)
         if noise_px > 0:
             pixel_pts = pixel_pts + np.random.default_rng(seed).normal(
                 0, noise_px, pixel_pts.shape
@@ -153,7 +166,7 @@ class SceneSpec:
         W, H = self.image_size
         vv, uu = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
         px = np.stack([uu.ravel(), vv.ravel()], axis=1).astype(float)
-        table = apply_homography(self.H_pixel_to_table, px)
+        table = self.unproject(px)
         tx, ty = table[:, 0], table[:, 1]
 
         img = np.empty((H * W, 3), dtype=float)
@@ -191,6 +204,65 @@ class SceneSpec:
             img += rng.normal(0, self.noise_sigma, img.shape)
 
         return np.clip(img, 0, 255).astype(np.uint8)
+
+    # -------------------------------------------------------------- motion
+
+    def translated(self, offsets: dict[int, tuple[float, float]]) -> "SceneSpec":
+        """A copy with some blocks moved, keyed by index into `blocks`."""
+        moved = []
+        for i, b in enumerate(self.blocks):
+            dx, dy = offsets.get(i, (0.0, 0.0))
+            moved.append(Block(b.x + dx, b.y + dy, b.theta, b.size, b.color))
+        return SceneSpec(
+            blocks=moved,
+            table_size_mm=self.table_size_mm,
+            image_size=self.image_size,
+            table_color=self.table_color,
+            perspective=self.perspective,
+            lighting_gradient=self.lighting_gradient,
+            noise_sigma=self.noise_sigma,
+            speckle_count=self.speckle_count,
+            seed=self.seed,
+        )
+
+    def sequence(
+        self,
+        velocities: dict[int, tuple[float, float]],
+        n_frames: int,
+        dt: float = 1 / 30,
+        *,
+        dropout: dict[int, set[int]] | None = None,
+    ):
+        """Yield (frame, truth) pairs for a moving scene.
+
+        `velocities` is mm/s per block index. `dropout` optionally hides a block
+        on given frame numbers, which simulates an occlusion: the detector loses
+        it entirely and the tracker has to coast the estimate across the gap and
+        then reclaim the same identity on the far side. That is the case a
+        tracker exists for, and the one a per-frame detector cannot handle.
+        """
+        dropout = dropout or {}
+        for k in range(n_frames):
+            offsets = {i: (vx * dt * k, vy * dt * k) for i, (vx, vy) in velocities.items()}
+            spec = self.translated(offsets)
+            hidden = {i for i, frames in dropout.items() if k in frames}
+            visible = SceneSpec(
+                blocks=[b for i, b in enumerate(spec.blocks) if i not in hidden],
+                table_size_mm=self.table_size_mm,
+                image_size=self.image_size,
+                table_color=self.table_color,
+                perspective=self.perspective,
+                lighting_gradient=self.lighting_gradient,
+                noise_sigma=self.noise_sigma,
+                speckle_count=self.speckle_count,
+                seed=self.seed + k,
+            )
+            truth = {
+                f"{b.color}{i}": (b.x, b.y)
+                for i, b in enumerate(spec.blocks)
+                if not b.is_obstacle
+            }
+            yield visible.render(), truth
 
     # --------------------------------------------------------- ground truth
 

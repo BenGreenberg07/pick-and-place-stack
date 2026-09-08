@@ -28,6 +28,21 @@ class OccupancyGrid:
     blocked: np.ndarray
     bounds: WorkspaceBounds
     resolution_mm: float
+    # The obstacles before any robot-radius inflation. `blocked` is inflated for
+    # one specific radius, so anything needing a different one -- a link thinner
+    # than the gripper, a carried block that makes it fatter -- has to re-inflate
+    # from here rather than from the already-grown array.
+    raw: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.raw is None:
+            self.raw = self.blocked.copy()
+
+    def inflate(self, clearance_mm: float) -> "OccupancyGrid":
+        """A new grid from the same raw obstacles, grown by a different radius."""
+        cells = int(np.ceil(clearance_mm / self.resolution_mm))
+        grown = dilate(self.raw, cells) if cells > 0 and self.raw.any() else self.raw.copy()
+        return OccupancyGrid(grown, self.bounds, self.resolution_mm, self.raw)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -136,7 +151,8 @@ def build_grid(
     if footprints:
         grid = erode(dilate(grid, 1), 1)
 
+    raw = grid.copy()
     inflate_cells = int(np.ceil(clearance_mm / resolution_mm))
     if inflate_cells > 0 and grid.any():
         grid = dilate(grid, inflate_cells)
-    return OccupancyGrid(grid, bounds, resolution_mm)
+    return OccupancyGrid(grid, bounds, resolution_mm, raw)

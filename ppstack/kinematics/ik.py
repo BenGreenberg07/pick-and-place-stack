@@ -280,3 +280,129 @@ def solve(
         seed = np.asarray(q_seed, dtype=float)
         return min(sols, key=lambda s: float(np.abs(_wrap(s.q - seed)).sum()))
     return solve_dls(arm, target, q_seed=q_seed, **kwargs)
+
+
+# ------------------------------------------------- the redundant solution set
+
+
+def enumerate_3link(
+    arm: PlanarArm, target: Point2D, *, n_orientations: int = 72
+) -> list[IKSolution]:
+    """Every solution for a 3-link planar arm, by sweeping the redundancy.
+
+    A 3R planar arm has three joints and a two-dimensional position task, so its
+    solutions form a one-parameter family: the self-motion manifold, along which
+    the arm changes shape while the tip stays put. Damped least squares finds
+    one point on that manifold, the one nearest whatever seed it was given.
+    That is fine until a downstream constraint like collision rejects it, at
+    which point "try a different random seed" is a poor substitute for knowing
+    what the alternatives are.
+
+    The manifold has a clean parameterisation. Fix the end-effector orientation
+    phi = q0 + q1 + q2. The wrist, meaning the origin of the last link, is then
+    pinned at
+
+        wrist = tip - L3 * (cos phi, sin phi)
+
+    and what remains is an ordinary 2-link problem with a closed-form solution,
+    solved here by the same Law of Cosines routine. Sweeping phi over a full
+    turn and taking both elbow branches at each step enumerates the family.
+
+    Returned sorted by manipulability, best-conditioned first, so a caller that
+    just wants a good solution can take the first one and a caller that needs a
+    collision-free one can walk the list.
+    """
+    if arm.n_joints != 3:
+        raise ValueError("enumerate_3link requires exactly three links")
+    target.require("base")
+    L1, L2, L3 = arm.link_lengths
+    wrist_arm = PlanarArm((L1, L2))
+
+    out: list[IKSolution] = []
+    for phi in np.linspace(-np.pi, np.pi, n_orientations, endpoint=False):
+        wrist = Point2D(target.x - L3 * np.cos(phi), target.y - L3 * np.sin(phi), "base")
+        try:
+            partials = solve_2link(wrist_arm, wrist)
+        except IKUnreachable:
+            continue  # this orientation puts the wrist outside the inner arm's reach
+        for p in partials:
+            q = _wrap(np.array([p.q[0], p.q[1], phi - p.q[0] - p.q[1]]))
+            if not arm.within_limits(q):
+                continue
+            tip = arm.forward(q)
+            err = float(np.hypot(tip.x - target.x, tip.y - target.y))
+            if err > 1e-6:
+                continue
+            out.append(
+                IKSolution(
+                    q=q,
+                    branch=f"phi={np.degrees(phi):+.0f} {p.branch}",
+                    position_error=err,
+                    iterations=0,
+                    manipulability=arm.manipulability(q),
+                )
+            )
+    out.sort(key=lambda s: -s.manipulability)
+    return out
+
+
+def enumerate_solutions(
+    arm: PlanarArm, target: Point2D, *, n_orientations: int = 72, restarts: int = 8
+) -> list[IKSolution]:
+    """All the distinct solutions this package can find, best-conditioned first.
+
+    Exact for two and three links. For four or more the manifold is
+    two-dimensional or worse and there is no closed form to sweep, so it falls
+    back to damped least squares from a spread of random seeds and deduplicates
+    whatever comes back.
+    """
+    if arm.n_joints == 2:
+        return sorted(solve_2link(arm, target), key=lambda s: -s.manipulability)
+    if arm.n_joints == 3:
+        return enumerate_3link(arm, target, n_orientations=n_orientations)
+
+    found: list[IKSolution] = []
+    for k in range(restarts):
+        try:
+            s = solve_dls(arm, target, rng=np.random.default_rng(k), restarts=2)
+        except IKUnreachable:
+            continue
+        if not any(np.allclose(s.q, o.q, atol=0.05) for o in found):
+            found.append(s)
+    found.sort(key=lambda s: -s.manipulability)
+    return found
+
+
+def solve_collision_free(
+    arm: PlanarArm,
+    target: Point2D,
+    checker,
+    *,
+    q_seed=None,
+    travel_weight: float = 0.15,
+    n_orientations: int = 72,
+):
+    """Pick the IK solution that is collision-free AND close to where we are.
+
+    Scored as manipulability minus a penalty on joint travel from `q_seed`, so
+    the arm prefers a well-conditioned posture but will not reconfigure halfway
+    around its workspace to get one. Returns None when every solution on the
+    manifold puts some part of the linkage inside an obstacle, which is a real
+    and common outcome and is not the same thing as the target being out of
+    reach.
+    """
+    candidates = enumerate_solutions(arm, target, n_orientations=n_orientations)
+    if not candidates:
+        return None
+    scale = max(1e-9, max(s.manipulability for s in candidates))
+
+    def score(s: IKSolution) -> float:
+        value = s.manipulability / scale
+        if q_seed is not None:
+            value -= travel_weight * float(np.abs(_wrap(s.q - np.asarray(q_seed))).sum())
+        return value
+
+    for s in sorted(candidates, key=score, reverse=True):
+        if not checker.collides(s.q):
+            return s
+    return None

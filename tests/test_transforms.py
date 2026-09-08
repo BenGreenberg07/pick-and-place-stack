@@ -121,3 +121,122 @@ def test_minimal_four_point_calibration_warns():
             px, tab, table_to_base=TABLE_TO_BASE, bounds=BOUNDS
         )
     assert cal.rms_residual_mm == pytest.approx(0.0, abs=1e-6)
+
+
+# ------------------------------------------------------- robust and distorted
+
+
+def test_ransac_excludes_a_mis_clicked_fiducial():
+    rng = np.random.default_rng(0)
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")])
+    px, tab = sc.calibration_correspondences(noise_px=0.4, grid=4)
+    px = px.copy()
+    px[5] += [40.0, -35.0]                    # one badly placed click
+
+    from ppstack.transforms.homography import fit_homography_ransac
+
+    H_ls = fit_homography(px, tab)
+    H_rc, inliers = fit_homography_ransac(px, tab, threshold=2.0)
+    good = np.ones(len(px), bool)
+    good[5] = False
+    assert not inliers[5]                     # the outlier is named, not smeared
+    assert inliers[good].all()
+    ls = np.median(reprojection_error(H_ls, px[good], tab[good]))
+    rc = np.median(reprojection_error(H_rc, px[good], tab[good]))
+    assert rc < ls / 3
+
+
+def test_ransac_needs_a_consensus_set():
+    rng = np.random.default_rng(1)
+    src = rng.uniform(0, 600, (10, 2))
+    dst = rng.uniform(0, 400, (10, 2))        # unrelated, no consistent homography
+    from ppstack.transforms.homography import fit_homography_ransac
+
+    H, inliers = fit_homography_ransac(src, dst, threshold=0.5)
+    assert inliers.sum() < len(src)
+
+
+def test_ransac_with_exactly_four_points_is_the_plain_fit():
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")])
+    px, tab = sc.calibration_correspondences(grid=2)
+    from ppstack.transforms.homography import fit_homography_ransac
+
+    H, inliers = fit_homography_ransac(px, tab)
+    assert inliers.all()
+    assert np.allclose(H, fit_homography(px, tab))
+
+
+def test_distortion_roundtrips():
+    from ppstack.transforms.distortion import RadialDistortion
+
+    rng = np.random.default_rng(2)
+    pts = np.stack([rng.uniform(0, 640, 200), rng.uniform(0, 480, 200)], axis=1)
+    for k1 in (0.0, 0.05, 0.12, -0.06):
+        lens = RadialDistortion.for_image((640, 480), k1)
+        assert np.abs(lens.distort(lens.undistort(pts)) - pts).max() < 1e-6
+
+
+def test_distortion_raises_instead_of_silently_diverging():
+    """Past the fold radius the inverse map has no fixed point."""
+    from ppstack.transforms.distortion import DistortionDiverged, RadialDistortion
+
+    lens = RadialDistortion.for_image((640, 480), -0.9)
+    with pytest.raises(DistortionDiverged):
+        lens.distort(np.array([[2000.0, 2000.0]]))
+
+
+@pytest.mark.parametrize("true_k1", [0.0, 0.05, 0.10])
+def test_k1_is_recovered_from_the_fiducials_alone(true_k1):
+    from ppstack.transforms.distortion import estimate_k1
+
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")], distortion_k1=true_k1)
+    px, tab = sc.calibration_correspondences(noise_px=0.3, grid=4)
+    lens, rms = estimate_k1(px, tab, sc.image_size)
+    assert lens.k1 == pytest.approx(true_k1, abs=0.02)
+    assert rms < 1.0
+
+
+def test_estimating_distortion_needs_redundant_fiducials():
+    from ppstack.transforms.distortion import estimate_k1
+
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")])
+    px, tab = sc.calibration_correspondences(grid=2)
+    with pytest.raises(ValueError, match="more than 4"):
+        estimate_k1(px, tab, sc.image_size)
+
+
+def test_distortion_aware_calibration_beats_the_naive_one():
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")], distortion_k1=0.10)
+    px, tab = sc.calibration_correspondences(noise_px=0.3, grid=4)
+    naive = CameraCalibration.from_correspondences(
+        px, tab, table_to_base=TABLE_TO_BASE, bounds=BOUNDS, max_residual_mm=1e9
+    )
+    aware = CameraCalibration.from_correspondences(
+        px, tab, table_to_base=TABLE_TO_BASE, bounds=BOUNDS, max_residual_mm=1e9,
+        estimate_distortion=True, image_size=sc.image_size,
+    )
+    assert aware.rms_residual_mm < naive.rms_residual_mm / 2
+
+
+def test_distortion_survives_a_json_roundtrip(tmp_path):
+    sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")], distortion_k1=0.08)
+    px, tab = sc.calibration_correspondences(noise_px=0.3, grid=4)
+    cal = CameraCalibration.from_correspondences(
+        px, tab, table_to_base=TABLE_TO_BASE, bounds=BOUNDS, max_residual_mm=1e9,
+        estimate_distortion=True, image_size=sc.image_size,
+    )
+    path = tmp_path / "cal.json"
+    cal.to_json(path)
+    other = CameraCalibration.from_json(path)
+    assert other.distortion is not None
+    assert other.distortion.k1 == pytest.approx(cal.distortion.k1)
+    assert other.pixel_to_table(320, 240).as_tuple() == pytest.approx(
+        cal.pixel_to_table(320, 240).as_tuple()
+    )
+
+
+def test_scene_projection_roundtrips_through_the_lens():
+    for k1 in (0.0, 0.09, -0.07):
+        sc = SceneSpec(blocks=[Block(200.0, 150.0, 0.0, 44.0, "red")], distortion_k1=k1)
+        tab = np.array([[x, y] for y in (20.0, 150.0, 280.0) for x in (20.0, 200.0, 380.0)])
+        assert np.abs(sc.unproject(sc.project(tab)) - tab).max() < 1e-9

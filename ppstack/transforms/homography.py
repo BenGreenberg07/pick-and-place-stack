@@ -99,3 +99,72 @@ def reprojection_error(H: np.ndarray, src: np.ndarray, dst: np.ndarray) -> np.nd
     """Per-correspondence residual, in the units of `dst`."""
     pred = apply_homography(H, src)
     return np.sqrt(((pred - np.asarray(dst, dtype=float)) ** 2).sum(axis=1))
+
+
+# ------------------------------------------------------------------- robust
+
+
+def fit_homography_ransac(
+    src: np.ndarray,
+    dst: np.ndarray,
+    *,
+    threshold: float = 2.0,
+    iterations: int = 400,
+    seed: int = 0,
+    refine: bool = True,
+):
+    """RANSAC homography. Returns (H, inlier_mask).
+
+    Least squares has no defence against a single bad correspondence. One
+    fiducial clicked on the wrong corner, or one auto-detected marker matched to
+    the wrong ID, drags the whole fit: the residual is spread across every
+    point, so the bad one is partly hidden and every good one is corrupted. The
+    symptom is a calibration whose residuals are all mediocre and none obviously
+    wrong.
+
+    RANSAC inverts the logic. Fit from a minimal 4-point sample, count how many
+    of the rest agree within `threshold`, keep the sample with the largest
+    consensus, then refit on that consensus set. The outlier is not
+    down-weighted, it is excluded, and it shows up plainly in the returned mask.
+
+    `threshold` is in the units of `dst`, so millimetres for this package's
+    pixel-to-table fits.
+    """
+    src = np.asarray(src, dtype=float)
+    dst = np.asarray(dst, dtype=float)
+    n = len(src)
+    if n < 4:
+        raise DegenerateCorrespondences(f"RANSAC needs at least 4 points, got {n}")
+    if n == 4:
+        H = fit_homography(src, dst)
+        return H, np.ones(4, dtype=bool)
+
+    rng = np.random.default_rng(seed)
+    best_H = None
+    best_inliers = np.zeros(n, dtype=bool)
+
+    for _ in range(iterations):
+        idx = rng.choice(n, 4, replace=False)
+        try:
+            H = fit_homography(src[idx], dst[idx])
+        except DegenerateCorrespondences:
+            continue  # a collinear sample, which is common and not an error
+        try:
+            residual = reprojection_error(H, src, dst)
+        except ValueError:
+            continue  # the sample produced a homography that folds a point to infinity
+        inliers = residual <= threshold
+        if inliers.sum() > best_inliers.sum():
+            best_H, best_inliers = H, inliers
+
+    if best_H is None or best_inliers.sum() < 4:
+        raise DegenerateCorrespondences(
+            "RANSAC found no consensus set of at least 4 points; the "
+            "correspondences are probably mismatched rather than merely noisy"
+        )
+    if refine:
+        # Refit on the full consensus set: the winning 4-point sample defines
+        # the inliers but is itself a minimal, noise-sensitive fit.
+        best_H = fit_homography(src[best_inliers], dst[best_inliers])
+        best_inliers = reprojection_error(best_H, src, dst) <= threshold
+    return best_H, best_inliers
